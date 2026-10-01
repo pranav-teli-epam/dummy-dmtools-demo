@@ -16,13 +16,16 @@ function test(description, fn) {
 }
 
 function assertThrows(fn, expectedMessage) {
+    let threw = false;
+    let err;
     try {
         fn();
-        throw new Error(`Expected error "${expectedMessage}" but no error was thrown`);
-    } catch (err) {
-        if (err.message === `Expected error "${expectedMessage}" but no error was thrown`) throw err;
-        assert.strictEqual(err.message, expectedMessage);
+    } catch (e) {
+        threw = true;
+        err = e;
     }
+    assert.ok(threw, `Expected error "${expectedMessage}" but no error was thrown`);
+    assert.strictEqual(err.message, expectedMessage);
 }
 
 console.log('Running tests for calculateDiscount...\n');
@@ -45,8 +48,11 @@ test('calculateDiscount(100, 100) === 0 (full discount)', () => {
 });
 
 // Multiple items — verify formula holds across a range
-test('calculateDiscount(50, 10) === 45 and calculateDiscount(300, 25) === 225', () => {
+test('calculateDiscount(50, 10) === 45', () => {
     assert.strictEqual(calculateDiscount(50, 10), 45);
+});
+
+test('calculateDiscount(300, 25) === 225', () => {
     assert.strictEqual(calculateDiscount(300, 25), 225);
 });
 

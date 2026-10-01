@@ -7,3 +7,6 @@ outputs/
 
 # CodeGraph generated index - regenerated per-run, must never be committed
 .codegraph/
+
+# Claude Code session identifier - ephemeral, must never be committed
+.claude-session-id

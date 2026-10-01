@@ -130,7 +130,7 @@
         }
       }
     },
-    "inputJql": "key = JD-107",
+    "inputJql": "key = KAN-1",
     "cliPrompts": [
       "Senior Code Reviewer & Security Expert",
       "./agents/instructions/common/agent_task_preamble.md",
