@@ -1,0 +1,19 @@
+{
+  "name": "Teammate",
+  "params": {
+    "metadata": {
+      "contextId": "story_development_redirect",
+      "descriptionPath": "agents/docs/agents/story_development_redirect.md"
+    },
+    "skipAIProcessing": true,
+    "outputType": "none",
+    "attachResponseAsFile": false,
+    "alwaysPostComments": false,
+    "ticketContextDepth": 0,
+    "preJSAction": "agents/js/redirectToRepoAgent.js",
+    "customParams": {
+      "targetAgentName": "story_development.json"
+    },
+    "inputJql": "key in (PLACEHOLDER-1)"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "name": "Teammate",
+  "params": {
+    "metadata": {
+      "contextId": "pr_test_automation_rework",
+      "descriptionPath": "agents/docs/agents/pr_test_automation_rework.md"
+    },
+    "cliCommands": [
+      "./agents/scripts/run-agent.sh"
+    ],
+    "outputType": "none",
+    "ticketContextDepth": 1,
+    "attachResponseAsFile": false,
+    "cleanupInputFolder": false,
+    "skipAIProcessing": true,
+    "alwaysPostComments": true,
+    "preJSAction": "agents/js/checkWipLabel.js",
+    "preCliJSAction": "agents/js/preCliTestReworkSetup.js",
+    "postJSAction": "agents/js/postTestReworkResults.js",
+    "customParams": {
+      "removeLabel": "sm_test_rework_triggered",
+      "checkOpenPR": true
+    },
+    "inputJql": "project = JD AND issuetype = 'Test Case' AND status = 'In Rework'",
+    "cliPrompts": [
+      "Senior QA Automation Engineer focused on test code fixes",
+      "./agents/instructions/common/agent_task_preamble.md",
+      "./agents/instructions/common/coding_guidelines.md",
+      "./agents/instructions/common/input_context_reading.md",
+      "./agents/instructions/pr_test_automation_rework/general_guidelines.md",
+      "./agents/instructions/pr_test_automation_rework/formatting_rules.md",
+      "./agents/instructions/test_automation/test_automation_instructions.md",
+      "./agents/instructions/test_automation/test_automation_output_files.md",
+      "./agents/instructions/test_automation/test_automation_json_output.md",
+      "./agents/instructions/common/dmtools_cli.md",
+      "./agents/prompts/bash_tools.md"
+    ],
+    "cliPromptsByTracker": {
+      "jira": [
+        "./agents/instructions/tracker/jira_comment_format.md"
+      ],
+      "ado": [
+        "./agents/instructions/tracker/ado_comment_format.md"
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "dummy-dmtools-demo",
+  "version": "1.0.0",
+  "description": "Demo project with broken code for DMTools automated fixing",
+  "main": "src/math.js",
+  "scripts": {
+    "test": "node test/math.test.js"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "Teammate",
+  "parent": {
+    "path": "story_development_redirect.json",
+    "merge": []
+  },
+  "params": {
+    "metadata": {
+      "contextId": "pr_rework_redirect",
+      "descriptionPath": "agents/docs/agents/pr_rework_redirect.md"
+    },
+    "customParams": {
+      "targetAgentName": "pr_rework.json"
+    }
+  }
+}

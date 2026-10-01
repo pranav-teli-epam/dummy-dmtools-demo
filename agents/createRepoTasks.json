@@ -1,0 +1,12 @@
+{
+  "name": "Teammate",
+  "params": {
+    "inputJql": "key = PROJ-1",
+    "skipAIProcessing": true,
+    "postJSAction": "agents/js/createRepoTasks.js",
+    "localExecution": true,
+    "metadata": {
+      "descriptionPath": "agents/docs/agents/createRepoTasks.md"
+    }
+  }
+}

@@ -1,0 +1,1840 @@
+/**
+ * Unit tests for js/smAgent.js
+ *
+ * Tests JQL interpolation, config loading, rule dispatch, and label skipping.
+ *
+ * Uses: configModule, configLoaderModule, loadModule(), makeRequire(), assert, test(), suite()
+ */
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Create a smAgent instance with full mock injection.
+ *
+ * The key design: a fresh configLoader is created per test using the SAME
+ * file_read mock, so config discovery paths are fully controlled by fileMap.
+ *
+ * file_read mock strategy:
+ *   - Paths containing ".dmtools/config" → only accessible if listed in fileMap
+ *     (ensures "no config" tests don't accidentally load the real project config)
+ *   - All other paths → forwarded to the real file_read (for agent JSON configs etc.)
+ *
+ * @param {Object} opts
+ *   fileMap        - { path: content } for config file discovery (config paths only)
+ *   tickets        - tickets returned by jira_search_by_jql (default: [])
+ *   fullTicket     - ticket returned by jira_get_ticket
+ *   onTrigger      - fn(owner, repo, workflow, inputs, ref) called on triggerWorkflow
+ *   onAddLabel     - fn(opts) called on jira_add_label
+ *   onMoveStatus   - fn(opts) called on jira_move_to_status
+ *   workflowRuns   - { queued: [], in_progress: [] } active workflow runs by status
+ */
+function makeSmAgent(opts) {
+    opts = opts || {};
+
+    var capturedTriggers = [];
+    var capturedLabels = [];
+    var capturedStatusMoves = [];
+    var capturedJqls = [];
+    var capturedCliCommands = [];
+
+    // Controlled file_read: config discovery paths from fileMap only; other paths from disk.
+    var fileReadMock = function(readOpts) {
+        var p = readOpts.path;
+        var isConfigDiscovery = p.indexOf('.dmtools/config') !== -1;
+
+        if (opts.fileMap && opts.fileMap.hasOwnProperty(p)) {
+            return opts.fileMap[p];
+        }
+        // Block config discovery for paths not in fileMap (so tests control exactly which config loads)
+        if (isConfigDiscovery) return null;
+
+        // Forward agent JSON / JS reads to disk
+        // Try with agents/ prefix first (submodule layout), then without (standalone)
+        try {
+            var result = file_read(readOpts);
+            if (result) return result;
+        } catch (e) {}
+        if (p.indexOf('agents/') === 0) {
+            try { return file_read({ path: p.substring('agents/'.length) }); } catch (e) {}
+        }
+        return null;
+    };
+
+    var jiraSearchMock = function(searchOpts) {
+        capturedJqls.push(searchOpts.jql);
+        return opts.tickets || [];
+    };
+
+    var smMocks = {
+        file_read: fileReadMock,
+        jira_search_by_jql: jiraSearchMock,
+        jira_get_ticket: function(key) {
+            return opts.fullTicket || { key: key, fields: { labels: [], summary: 'Test ticket' } };
+        },
+        jira_add_label: function(labelOpts) {
+            capturedLabels.push(labelOpts);
+            if (opts.onAddLabel) opts.onAddLabel(labelOpts);
+        },
+        jira_remove_label: function() {},
+        jira_move_to_status: function(moveOpts) {
+            capturedStatusMoves.push(moveOpts);
+            if (opts.onMoveStatus) opts.onMoveStatus(moveOpts);
+        },
+        cli_execute_command: function(cmdOpts) {
+            capturedCliCommands.push(cmdOpts);
+            if (opts.onCliExecute) return opts.onCliExecute(cmdOpts);
+            return '';
+        },
+        file_write: function(writeOpts) {
+            if (opts.onFileWrite) opts.onFileWrite(writeOpts);
+            return true;
+        },
+        encodeURIComponent: encodeURIComponent,
+        JSON: JSON,
+        eval: eval
+    };
+
+    // SCM mock: intercepts triggerWorkflow so capturedTriggers is populated
+    var mockScmProvider = {
+        triggerWorkflow: function(owner, repo, workflow, inputs, ref) {
+            capturedTriggers.push({ owner: owner, repo: repo, workflow: workflow, inputs: inputs, ref: ref });
+            if (opts.onTrigger) opts.onTrigger(owner, repo, workflow, inputs, ref);
+        },
+        listPrs: function() { return '[]'; },
+        getPr: function() { return '{}'; },
+        getPrComments: function() { return '[]'; },
+        addComment: function() {},
+        replyToThread: function() {},
+        resolveThread: function() {},
+        mergePr: function() {},
+        addLabel: function() {},
+        removeLabel: function() {},
+        fetchDiscussions: function() { return { markdown: '', rawThreads: [] }; },
+        listWorkflowRuns: function(status) {
+            var byStatus = opts.workflowRuns || {};
+            return JSON.stringify({ workflow_runs: byStatus[status] || [] });
+        },
+        getRemoteRepoInfo: function() { return null; }
+    };
+    var mockScmModule = {
+        createScm: function(config) { return mockScmProvider; }
+    };
+
+    // CRITICAL: create a fresh configLoader using the SAME file_read mock.
+    // If we reuse the global configLoaderModule, it calls the real file_read and
+    // would load the actual .dmtools/config.js regardless of what fileMap says.
+    var freshConfigLoader = loadModule(
+        'js/configLoader.js',
+        makeRequire({ './config.js': configModule, './common/scm.js': mockScmModule }),
+        { file_read: fileReadMock }
+    );
+
+    var buildEncodedConfigModule = loadModule(
+        'js/common/buildEncodedConfig.js',
+        makeRequire({ '../configLoader.js': freshConfigLoader }),
+        { file_read: fileReadMock, encodeURIComponent: encodeURIComponent, JSON: JSON }
+    );
+
+    var sm = loadModule(
+        'js/smAgent.js',
+        makeRequire({
+            './configLoader.js': freshConfigLoader,
+            './common/scm.js': mockScmModule,
+            './common/buildEncodedConfig.js': buildEncodedConfigModule
+        }),
+        smMocks
+    );
+
+    return {
+        action: sm.action,
+        capturedTriggers: capturedTriggers,
+        capturedLabels: capturedLabels,
+        capturedStatusMoves: capturedStatusMoves,
+        capturedJqls: capturedJqls,
+        capturedCliCommands: capturedCliCommands
+    };
+}
+
+/** Minimal sm.json-style rule */
+function makeRule(jql, overrides) {
+    var base = {
+        description: 'test rule',
+        jql: jql,
+        configFile: 'agents/test.json'
+    };
+    if (overrides) {
+        for (var k in overrides) {
+            if (overrides.hasOwnProperty(k)) base[k] = overrides[k];
+        }
+    }
+    return base;
+}
+
+/** Base jobParams with owner/repo */
+function baseParams(owner, repo, rules) {
+    return {
+        jobParams: {
+            owner: owner || 'test-org',
+            repo: repo || 'test-repo',
+            rules: rules || []
+        }
+    };
+}
+
+/** JSON string for a minimal agent config with postJSAction */
+var MINIMAL_AGENT_CONFIG = JSON.stringify({
+    name: 'JSRunner',
+    params: {
+        postJSAction: 'js/unit-tests/_fixtures/noop.js',
+        customParams: {}
+    }
+});
+
+suite('sm.json rule ordering', function() {
+    test('failed test case bug creation runs before bug development consumes workflow cap', function() {
+        var config = JSON.parse(file_read({ path: 'sm.json' }));
+        var rules = config.params.jobParams.rules;
+        var indexByDescription = {};
+
+        rules.forEach(function(rule, index) {
+            indexByDescription[rule.description] = index;
+        });
+
+        var failedTcBulk = indexByDescription['Failed Test Cases → create or link bugs in batch'];
+        var bugDevelopment = indexByDescription['Backlog / To Do / Ready For Development / In Development / In Rework Bugs → trigger bug_development'];
+
+        assert.ok(failedTcBulk >= 0, 'failed TC bulk creation rule exists');
+        assert.ok(bugDevelopment >= 0, 'bug development rule exists');
+        assert.ok(
+            failedTcBulk < bugDevelopment,
+            'failed TC bug creation must be prioritized before bug development uses maxTriggeredWorkflows'
+        );
+    });
+
+    test('bug development has a cooldown to avoid Copilot rate-limit retry storms', function() {
+        var config = JSON.parse(file_read({ path: 'sm.json' }));
+        var rules = config.params.jobParams.rules;
+        var bugDevelopment = null;
+
+        rules.forEach(function(rule) {
+            if (rule.description === 'Backlog / To Do / Ready For Development / In Development / In Rework Bugs → trigger bug_development') {
+                bugDevelopment = rule;
+            }
+        });
+
+        assert.ok(bugDevelopment, 'bug development rule exists');
+        assert.contains(bugDevelopment.jql, 'updated <= -15m');
+        assert.equal(bugDevelopment.limit, 1, 'bug development should retry one ticket per SM cycle to avoid Copilot rate-limit bursts');
+        assert.equal(bugDevelopment.concurrencyKey, 'bug_development', 'bug development should use shared active-run detection across SM cycles');
+    });
+
+    test('recover merged PR runs before pr_rework so In Rework tickets with merged PR are recovered first', function() {
+        var config = JSON.parse(file_read({ path: 'sm.json' }));
+        var rules = config.params.jobParams.rules;
+        var indexByDescription = {};
+
+        rules.forEach(function(rule, index) {
+            indexByDescription[rule.description] = index;
+        });
+
+        var recoverMerged = indexByDescription['Review/Rework/Blocked Stories & Bugs with already merged PR → recover Merged status'];
+        var prRework = indexByDescription['In Rework Stories & Bugs → trigger pr_rework'];
+
+        assert.ok(recoverMerged >= 0, 'recover merged PR rule exists');
+        assert.ok(prRework >= 0, 'pr_rework rule exists');
+        assert.ok(
+            recoverMerged < prRework,
+            'recover_merged_pr must run before pr_rework to avoid starting rework on tickets whose PR is already merged'
+        );
+    });
+
+    test('stuck test case recovery has a cooldown to avoid racing active automation', function() {
+        var config = JSON.parse(file_read({ path: 'sm.json' }));
+        var rules = config.params.jobParams.rules;
+        var stuckRecovery = null;
+
+        rules.forEach(function(rule) {
+            if (rule.description === 'Stuck In Development Test Cases → recover (check PR, route to Rework/Review/Backlog)') {
+                stuckRecovery = rule;
+            }
+        });
+
+        assert.ok(stuckRecovery, 'stuck test case recovery rule exists');
+        assert.contains(stuckRecovery.jql, 'updated <= -15m');
+        assert.equal(stuckRecovery.localExecution, true, 'recovery should stay local execution');
+    });
+});
+
+// ── JQL interpolation ─────────────────────────────────────────────────────────
+
+suite('smAgent: JQL interpolation', function() {
+
+    test('replaces {jiraProject} with project from config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "MYPROJ", parentTicket: "MYPROJ-1" }, repository: { owner: "test-org", repo: "test-repo" } };'
+            }
+        });
+
+        sm.action(baseParams('test-org', 'test-repo', [
+            makeRule("project = {jiraProject} AND issuetype = 'Story'")
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1, 'one JQL was executed');
+        assert.contains(sm.capturedJqls[0], 'project = MYPROJ', 'project placeholder replaced');
+        assert.notContains(sm.capturedJqls[0], '{jiraProject}', 'placeholder removed');
+    });
+
+    test('replaces {parentTicket} with parentTicket from config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "PROJ", parentTicket: "PROJ-99" }, repository: { owner: "o", repo: "r" } };'
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND parent = {parentTicket}")
+        ]));
+
+        assert.contains(sm.capturedJqls[0], 'parent = PROJ-99', 'parentTicket placeholder replaced');
+    });
+
+    test('leaves JQL unchanged when no config file found', function() {
+        var sm = makeSmAgent({ fileMap: {} }); // no config file
+
+        sm.action(baseParams('test-org', 'test-repo', [
+            makeRule("project = HARDCODED AND issuetype = 'Bug'")
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1);
+        assert.contains(sm.capturedJqls[0], 'project = HARDCODED', 'hardcoded JQL preserved');
+    });
+
+    test('multiple rules each get JQL interpolated', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "MULTI", parentTicket: "MULTI-1" }, repository: { owner: "o", repo: "r" } };'
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Backlog'"),
+            makeRule("project = {jiraProject} AND status = 'In Review'"),
+            makeRule("project = {jiraProject} AND parent = {parentTicket}")
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 3);
+        assert.contains(sm.capturedJqls[0], 'project = MULTI');
+        assert.contains(sm.capturedJqls[1], 'project = MULTI');
+        assert.contains(sm.capturedJqls[2], 'parent = MULTI-1');
+    });
+
+});
+
+// ── Config overrides ──────────────────────────────────────────────────────────
+
+suite('smAgent: config repository override', function() {
+
+    test('uses repository from config when provided', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { repository: { owner: "config-org", repo: "config-repo" }, jira: { project: "P" } };'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                owner: 'params-org',   // should be overridden
+                repo: 'params-repo',   // should be overridden
+                rules: [makeRule("project = {jiraProject} AND status = 'Backlog'")]
+            }
+        });
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        assert.equal(sm.capturedTriggers[0].owner, 'config-org', 'config owner used');
+        assert.equal(sm.capturedTriggers[0].repo, 'config-repo', 'config repo used');
+    });
+
+    test('uses params owner/repo when no config file', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('param-owner', 'param-repo', [
+            makeRule("project = FIXED AND status = 'Ready'")
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        assert.equal(sm.capturedTriggers[0].owner, 'param-owner');
+        assert.equal(sm.capturedTriggers[0].repo, 'param-repo');
+    });
+
+});
+
+// ── smRules override ──────────────────────────────────────────────────────────
+
+suite('smAgent: smRules override from config', function() {
+
+    test('uses smRules from config when provided — ignores params.rules', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  jira: { project: "PROJ" },' +
+                    '  smRules: [{' +
+                    '    jql: "project = {jiraProject} AND status = \'Custom\'",' +
+                    '    configFile: "agents/custom.json",' +
+                    '    description: "custom rule from config"' +
+                    '  }]' +
+                    '};'
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = SHOULD_NOT_RUN AND status = 'Backlog'") // should be ignored
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1, 'only config rules ran');
+        assert.contains(sm.capturedJqls[0], "status = 'Custom'", 'config rule JQL used');
+        assert.notContains(sm.capturedJqls[0], 'SHOULD_NOT_RUN', 'params rule ignored');
+    });
+
+    test('uses params.rules when config smRules is null', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" }, smRules: null };'
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Params Rule'")
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1);
+        assert.contains(sm.capturedJqls[0], "status = 'Params Rule'", 'params rule used');
+    });
+
+});
+
+// ── Ticket dispatch ───────────────────────────────────────────────────────────
+
+suite('smAgent: ticket dispatch', function() {
+
+    test('triggers workflow for each ticket found', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } },
+                { key: 'P-2', fields: { labels: [] } },
+                { key: 'P-3', fields: { labels: [] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'")
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 3, 'one trigger per ticket');
+        assert.equal(sm.capturedTriggers[0].owner, 'o');
+        assert.equal(sm.capturedTriggers[0].workflow, 'ai-teammate.yml');
+    });
+
+    test('global maxTriggeredWorkflows caps dispatches across all rules', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } },
+                { key: 'P-2', fields: { labels: [] } },
+                { key: 'P-3', fields: { labels: [] } }
+            ]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'"),
+            makeRule("project = {jiraProject} AND status = 'In Review'")
+        ]);
+        params.jobParams.maxTriggeredWorkflows = 1;
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 1, 'only one workflow dispatch allowed for whole run');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.concurrency_key, 'P-1', 'first ticket dispatched, others deferred');
+    });
+
+    test('global maxTriggeredWorkflows counts already active workflows before dispatch', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } }
+            ],
+            workflowRuns: {
+                in_progress: [
+                    { id: 1001, name: 'agents/bug_development.json : bug_development', status: 'in_progress' }
+                ]
+            }
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                addLabel: 'sm_bulk_bugs_creation_triggered',
+                targetStatus: 'Bug Creation'
+            })
+        ]);
+        params.jobParams.maxTriggeredWorkflows = 1;
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 0, 'active workflow consumes the only global slot');
+        assert.equal(sm.capturedLabels.length, 0, 'trigger label must not be added when cap is full');
+        assert.equal(sm.capturedStatusMoves.length, 0, 'ticket should not move when no workflow slot is available');
+    });
+
+    test('global maxTriggeredWorkflows ignores stale queued workflows before dispatch', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } }
+            ],
+            workflowRuns: {
+                queued: [
+                    {
+                        id: 1002,
+                        name: 'AI Teammate',
+                        status: 'queued',
+                        created_at: '2020-01-01T00:00:00Z',
+                        updated_at: '2020-01-01T00:00:00Z'
+                    }
+                ]
+            }
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'")
+        ]);
+        params.jobParams.maxTriggeredWorkflows = 1;
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 1, 'stale queued workflow should not consume the global slot');
+    });
+
+    test('maxWorkflowsPerRun alias also limits dispatches', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } },
+                { key: 'P-2', fields: { labels: [] } }
+            ]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'")
+        ]);
+        params.jobParams.maxWorkflowsPerRun = 1;
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 1, 'alias field limits dispatches');
+    });
+
+    test('encodes ticket key in triggered workflow inputs', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-42', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { configFile: 'agents/story_development.json' })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.concurrency_key, 'P-42', 'concurrency key set to ticket key');
+        assert.equal(inputs.display_key, 'P-42', 'workflow display key set to ticket key');
+        assert.equal(inputs.input_jql, 'key = P-42', 'workflow input JQL set to ticket key');
+        assert.equal(inputs.config_file, 'agents/story_development.json', 'config_file passed');
+        assert.ok(inputs.encoded_config, 'encoded_config present');
+
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.contains(decoded.params.inputJql, 'P-42', 'ticket key in inputJql');
+    });
+
+    test('uses rule concurrencyKey override while preserving ticket inputJql', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-42', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/bulk_bugs_creation.json',
+                concurrencyKey: 'bulk_bugs_creation'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.concurrency_key, 'bulk_bugs_creation', 'rule concurrency key used');
+        assert.equal(inputs.display_key, 'P-42', 'workflow display key preserves ticket key');
+        assert.equal(inputs.input_jql, 'key = P-42', 'workflow input JQL remains ticket-specific');
+
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.contains(decoded.params.inputJql, 'P-42', 'ticket key still used for agent input');
+    });
+
+    test('interpolates project placeholders from target agent params into encoded config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = { jira: { project: "DMC", parentTicket: "DMC-101" }, repository: { owner: "o", repo: "r" } };',
+                'agents/test_cases_generator.json': JSON.stringify({
+                    name: 'TestCasesGenerator',
+                    params: {
+                        existingTestCasesJql: "project = {jiraProject} AND issuetype = 'Test Case'",
+                        relatedStoriesJql: "parent = {parentTicket}"
+                    }
+                })
+            },
+            tickets: [{ key: 'DMC-857', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { configFile: 'agents/test_cases_generator.json' })
+        ]));
+
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.equal(decoded.params.existingTestCasesJql, "project = DMC AND issuetype = 'Test Case'");
+        assert.equal(decoded.params.relatedStoriesJql, 'parent = DMC-101');
+    });
+
+    test('no triggers when no tickets found', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: []
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}")
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 0);
+    });
+
+    test('uses workflowFile from rule when provided', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule('project = X', {
+                workflowFile: 'custom-workflow.yml',
+                workflowRef: 'develop'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers[0].workflow, 'custom-workflow.yml');
+        assert.equal(sm.capturedTriggers[0].ref, 'develop');
+    });
+
+    test('skips dispatch when matching workflow is already active', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-42', fields: { labels: [] } }],
+            workflowRuns: {
+                in_progress: [
+                    { name: 'agents/pr_rework.json : P-42', status: 'in_progress' }
+                ]
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/pr_rework.json',
+                addLabel: 'sm_story_rework_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 0, 'duplicate active workflow should not be dispatched');
+        assert.equal(sm.capturedLabels.length, 0, 'skip label should not be added for skipped duplicate');
+    });
+
+});
+
+// ── localTeammate execution mode ────────────────────────────────────────────
+
+// runTeammateLocally() issues two cli_execute_command calls per ticket: the actual
+// run-teammate-local.sh invocation, plus a best-effort `rm -f` cleanup of the temp
+// encoded-config file. Filter to just the script invocations for assertions below.
+function localRunCommands(sm) {
+    return sm.capturedCliCommands.filter(function(c) {
+        return c.command.indexOf('run-teammate-local.sh') !== -1;
+    });
+}
+
+suite('smAgent: localTeammate execution mode', function() {
+
+    test('runs local script instead of dispatching a workflow', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 0, 'no GitHub Actions workflow should be dispatched');
+        var runs = localRunCommands(sm);
+        assert.equal(runs.length, 1, 'exactly one local run invoked');
+        var cmd = runs[0].command;
+        assert.ok(cmd.indexOf('scripts/run-teammate-local.sh') !== -1, 'invokes run-teammate-local.sh');
+        assert.ok(cmd.indexOf('--config-file agents/story_development.json') !== -1, 'passes config file');
+        assert.ok(cmd.indexOf('--ticket P-1') !== -1, 'passes ticket key');
+    });
+
+    test('passes --base-branch from config.git.baseBranch (e.g. repos defaulting to master)', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" }, git: { baseBranch: "master" } };'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true
+            })
+        ]));
+
+        var runs = localRunCommands(sm);
+        assert.equal(runs.length, 1, 'exactly one local run invoked');
+        assert.ok(runs[0].command.indexOf('--base-branch master') !== -1,
+            'passes the project-configured base branch instead of silently defaulting to "main"');
+    });
+
+    test('adds rule labels after a successful local run', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true,
+                addLabel: 'sm_story_development_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 1);
+        assert.equal(sm.capturedLabels[0].label, 'sm_story_development_triggered');
+    });
+
+    test('does not add rule labels when the local run throws', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }],
+            onCliExecute: function() { throw new Error('script failed'); }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true,
+                addLabel: 'sm_story_development_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 0, 'no label added when the local run fails');
+    });
+
+    // Regression test for a real production bug: pr_review.json/pr_rework.json's own
+    // postJSAction removes its addLabel (sm_story_review_triggered / sm_story_rework_triggered)
+    // as part of completing, to let a ticket cycle between In Review <-> In Rework. Since
+    // runTeammateLocally() runs that entire job synchronously, re-adding the label afterward
+    // would immediately undo that cleanup and permanently stick the ticket (no stale-label
+    // recovery exists for local rules) — this is exactly what happened to SOHO-131.
+    test('does not re-add the label after a local run when the target job self-manages it', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };',
+                'agents/pr_review.json': JSON.stringify({
+                    params: { customParams: { removeLabel: 'sm_story_review_triggered' } }
+                })
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/pr_review.json',
+                localTeammate: true,
+                addLabel: 'sm_story_review_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 0,
+            'smAgent must not re-add a label the target job manages/removes itself');
+    });
+
+    test('does not re-add any addLabels when the target job self-manages one of them via removeLabels', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };',
+                'agents/pr_rework.json': JSON.stringify({
+                    params: { customParams: { removeLabels: ['sm_story_rework_triggered', 'sm_story_review_triggered'] } }
+                })
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/pr_rework.json',
+                localTeammate: true,
+                addLabel: 'sm_story_rework_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 0,
+            'smAgent must not re-add sm_story_rework_triggered either, since pr_rework.json manages it');
+    });
+
+    test('still adds the label for a non-self-managing local rule (unaffected by the self-managing check)', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };',
+                'agents/story_solution.json': JSON.stringify({ params: { customParams: {} } })
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_solution.json',
+                localTeammate: true,
+                addLabel: 'sm_story_solution_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 1, 'label is still added when the target job does not self-manage it');
+        assert.equal(sm.capturedLabels[0].label, 'sm_story_solution_triggered');
+    });
+
+    test('respects skipIfLabel without checking GitHub Actions run state', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: ['sm_story_development_triggered'] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true,
+                skipIfLabel: 'sm_story_development_triggered'
+            })
+        ]));
+
+        assert.equal(localRunCommands(sm).length, 0, 'labelled ticket should be skipped, not run locally');
+    });
+
+    test('processes tickets one at a time regardless of maxTriggeredWorkflows', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [
+                { key: 'P-1', fields: { labels: [] } },
+                { key: 'P-2', fields: { labels: [] } },
+                { key: 'P-3', fields: { labels: [] } }
+            ]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true
+            })
+        ]);
+        // A tight global cap must not throttle localTeammate rules — they run
+        // synchronously in-process, so there is no outstanding-workflow budget to spend.
+        params.jobParams.maxTriggeredWorkflows = 1;
+
+        var result = sm.action(params);
+
+        assert.equal(localRunCommands(sm).length, 3, 'all three tickets should run locally, uncapped');
+        assert.equal(result.processed, 3);
+    });
+
+    test('writes the encoded config to a temp file and passes its path', function() {
+        var writtenFiles = [];
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-7', fields: { labels: [] } }],
+            onFileWrite: function(writeOpts) { writtenFiles.push(writeOpts); }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: true
+            })
+        ]));
+
+        assert.equal(writtenFiles.length, 1, 'encoded config should be written once');
+        assert.ok(writtenFiles[0].path.indexOf('P-7') !== -1, 'temp file name includes the ticket key');
+        var cmd = sm.capturedCliCommands[0].command;
+        assert.ok(cmd.indexOf('--encoded-config-file') !== -1, 'passes the encoded config file path');
+    });
+
+});
+
+suite('smAgent: forceLocalTeammate CLI override', function() {
+
+    test('switches a default-dispatch rule to local execution', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                configFile: 'agents/story_development.json'
+            })
+        ]);
+        params.jobParams.forceLocalTeammate = true;
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 0, 'no GitHub Actions workflow should be dispatched');
+        assert.equal(localRunCommands(sm).length, 1, 'rule runs locally instead of dispatching');
+    });
+
+    test('leaves localExecution:true rules untouched', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };',
+                'agents/test.json': MINIMAL_AGENT_CONFIG
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { localExecution: true })
+        ]);
+        params.jobParams.forceLocalTeammate = true;
+
+        sm.action(params);
+
+        assert.equal(localRunCommands(sm).length, 0, 'localExecution rules do not go through run-teammate-local.sh');
+        assert.equal(sm.capturedTriggers.length, 0, 'localExecution rules never dispatch either');
+    });
+
+    test('respects an explicit localTeammate:false opt-out', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configFile: 'agents/story_development.json',
+                localTeammate: false
+            })
+        ]);
+        params.jobParams.forceLocalTeammate = true;
+
+        sm.action(params);
+
+        assert.equal(localRunCommands(sm).length, 0, 'opted-out rule must not run locally');
+        assert.equal(sm.capturedTriggers.length, 1, 'opted-out rule dispatches as normal');
+    });
+
+    test('is a no-op when not set (default remote dispatch)', function() {
+        var sm = makeSmAgent({
+            fileMap: { '../.dmtools/config.js': 'module.exports = { jira: { project: "P" }, repository: { owner: "o", repo: "r" } };' },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        var params = baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { configFile: 'agents/story_development.json' })
+        ]);
+        // forceLocalTeammate intentionally omitted
+
+        sm.action(params);
+
+        assert.equal(sm.capturedTriggers.length, 1, 'default behavior still dispatches to GitHub Actions');
+        assert.equal(localRunCommands(sm).length, 0);
+    });
+
+});
+
+// ── localExecution module loading ─────────────────────────────────────────────
+
+suite('smAgent: localExecution module loading', function() {
+
+    test('local post action can require common/scm.js', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'agents/local_scm_test.json': JSON.stringify({
+                    name: 'JSRunner',
+                    params: {
+                        postJSAction: 'js/unit-tests/_fixtures/local_scm_check.js'
+                    }
+                }),
+                'js/unit-tests/_fixtures/local_scm_check.js':
+                    'var scmModule = require("./common/scm.js");\n' +
+                    'function action(params) {\n' +
+                    '  if (!scmModule || typeof scmModule.createScm !== "function") throw new Error("createScm missing");\n' +
+                    '  return { success: true, action: "scm ok" };\n' +
+                    '}\n' +
+                    'module.exports = { action: action };'
+            },
+            tickets: [{ key: 'T-1', fields: { labels: [] } }],
+            fullTicket: { key: 'T-1', fields: { labels: [], summary: 'Ticket' } }
+        });
+
+        var result = sm.action(baseParams('o', 'r', [
+            makeRule('project = X', {
+                configFile: 'agents/local_scm_test.json',
+                localExecution: true
+            })
+        ]));
+
+        assert.equal(result.processed, 1, 'local action processed ticket');
+        assert.deepEqual(result.processedKeys, ['T-1']);
+    });
+
+});
+
+// ── skipIfLabel ───────────────────────────────────────────────────────────────
+
+suite('smAgent: skipIfLabel', function() {
+
+    test('skips ticket that already has the label', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-1', fields: { labels: ['sm_triggered'] } },
+                { key: 'T-2', fields: { labels: [] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { skipIfLabel: 'sm_triggered' })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1, 'only T-2 triggered');
+        assert.equal(sm.capturedTriggers[0].owner, 'o');
+        // Check which ticket was triggered
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.contains(inputs.encoded_config, 'T-2', 'T-2 was triggered, not T-1');
+    });
+
+    test('adds label after successful trigger', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-10', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { addLabel: 'sm_dev_triggered' })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 1);
+        assert.equal(sm.capturedLabels[0].key, 'T-10');
+        assert.equal(sm.capturedLabels[0].label, 'sm_dev_triggered');
+    });
+
+    test('does not recover trigger label when explicitly disabled', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-1', fields: { labels: ['sm_triggered'] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                skipIfLabel: 'sm_triggered',
+                addLabel: 'sm_triggered',
+                recoverStaleTriggerLabel: false
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 0, 'no trigger for skipped ticket');
+        assert.equal(sm.capturedLabels.length, 0, 'no label added for skipped ticket');
+    });
+
+    test('recovers stale trigger label by default when no active workflow exists', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-1', fields: { labels: ['sm_triggered'] } }
+            ],
+            workflowRuns: {
+                queued: [],
+                in_progress: []
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                skipIfLabel: 'sm_triggered',
+                addLabel: 'sm_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1, 'stale label should not deadlock ticket');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.contains(inputs.encoded_config, 'T-1', 'T-1 was retriggered');
+    });
+
+    test('uses shared concurrencyKey when checking active workflow for stale label recovery', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-1', fields: { labels: ['sm_bulk_bugs_creation_triggered'] } }
+            ],
+            workflowRuns: {
+                queued: [
+                    {
+                        display_title: 'agents/bulk_bugs_creation.json : T-1 : bulk_bugs_creation',
+                        status: 'queued'
+                    }
+                ],
+                in_progress: []
+            }
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                configFile: 'agents/bulk_bugs_creation.json',
+                concurrencyKey: 'bulk_bugs_creation',
+                skipIfLabel: 'sm_bulk_bugs_creation_triggered',
+                addLabel: 'sm_bulk_bugs_creation_triggered',
+                recoverStaleTriggerLabel: true
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 0, 'active shared-concurrency run should prevent relaunch');
+    });
+
+    test('skips ticket that has any skipIfLabels entry', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-old', fields: { labels: ['sm_story_acceptance_criterias_triggered'] } },
+                { key: 'T-new', fields: { labels: ['sm_story_acceptance_criteria_triggered'] } },
+                { key: 'T-open', fields: { labels: [] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                skipIfLabels: [
+                    'sm_story_acceptance_criteria_triggered',
+                    'sm_story_acceptance_criterias_triggered'
+                ]
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1, 'only unlabeled ticket triggered');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.contains(inputs.encoded_config, 'T-open', 'T-open was triggered');
+    });
+
+    test('adds all configured addLabels after successful trigger', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-20', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                addLabel: 'primary_label',
+                addLabels: ['secondary_label']
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 2);
+        assert.equal(sm.capturedLabels[0].label, 'primary_label');
+        assert.equal(sm.capturedLabels[1].label, 'secondary_label');
+    });
+
+    // The self-managing skip only applies to localTeammate (synchronous) rules — for the
+    // async workflow_dispatch path the label really is the only in-flight guard (the actual
+    // job runs later on a GitHub Actions runner and clears it on completion), so it must
+    // still be added right after a successful dispatch even if the target config also
+    // happens to declare a matching removeLabel.
+    test('still adds the label after an async dispatch even if the target config declares a matching removeLabel', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'agents/pr_review.json': JSON.stringify({
+                    params: { customParams: { removeLabel: 'sm_story_review_triggered' } }
+                })
+            },
+            tickets: [{ key: 'T-21', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", {
+                configFile: 'agents/pr_review.json',
+                addLabel: 'sm_story_review_triggered'
+            })
+        ]));
+
+        assert.equal(sm.capturedLabels.length, 1,
+            'async dispatch must still add its idempotency label regardless of the self-managing check');
+    });
+
+});
+
+// ── Rule enabled flag ─────────────────────────────────────────────────────────
+
+suite('smAgent: rule enabled flag', function() {
+
+    test('skips rule with enabled: false', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { enabled: false })
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 0, 'JQL not executed for disabled rule');
+        assert.equal(sm.capturedTriggers.length, 0);
+    });
+
+    test('runs rule with enabled: true (explicit)', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: []
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { enabled: true })
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1, 'enabled rule executed');
+    });
+
+    test('limit caps tickets processed', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-1', fields: { labels: [] } },
+                { key: 'T-2', fields: { labels: [] } },
+                { key: 'T-3', fields: { labels: [] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { limit: 2 })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 2, 'only 2 tickets processed (limit: 2)');
+    });
+
+    test('limit applies after skipped tickets so stale labels do not starve later tickets', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [
+                { key: 'T-skipped', fields: { labels: ['sm_triggered'] } },
+                { key: 'T-open', fields: { labels: [] } }
+            ]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { skipIfLabel: 'sm_triggered', limit: 1 })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1, 'one non-skipped ticket should be triggered');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.contains(inputs.encoded_config, 'T-open', 'limit should not be consumed by skipped ticket');
+    });
+
+});
+
+// ── additionalInstructions injection ─────────────────────────────────────────
+
+suite('smAgent: additionalInstructions in encoded_config', function() {
+
+    test('injects additionalInstructions from config into encoded_config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "P" },' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  additionalInstructions: {' +
+                    '    story_development: ["https://my-wiki/pages/123", "./custom/rules.md"]' +
+                    '  }' +
+                    '};'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { configFile: 'agents/story_development.json' })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.ok(decoded.params.additionalInstructions, 'additionalInstructions present in encoded_config');
+        assert.equal(decoded.params.additionalInstructions.length, 2);
+        assert.contains(decoded.params.additionalInstructions[0], 'my-wiki', 'first instruction');
+    });
+
+    test('no additionalInstructions field in encoded_config when not configured', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { configFile: 'agents/story_development.json' })
+        ]));
+
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.notOk(decoded.params.additionalInstructions, 'no additionalInstructions when not configured');
+        assert.ok(decoded.params.agentParams, 'agentParams present');
+        // The story_development agent now keeps its default instructions in cliPrompts,
+        // not in agentParams.instructions, so we verify the default cliPrompts survive.
+        var storyDevRaw = file_read({ path: 'agents/story_development.json' }) ||
+                          file_read({ path: 'story_development.json' });
+        var storyDevJson = JSON.parse(storyDevRaw);
+        var defaultCliPrompts = storyDevJson.params.cliPrompts;
+        assert.ok(Array.isArray(decoded.params.cliPrompts) && decoded.params.cliPrompts.length > 0,
+            'default cliPrompts preserved');
+        assert.deepEqual(decoded.params.cliPrompts, defaultCliPrompts,
+            'default cliPrompts match the agent JSON');
+    });
+
+    test('injects cliPrompts and agent/job param patches from config into encoded_config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "P" },' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  cliPromptOverrides: {' +
+                    '    story_development: "./.dmtools/prompts/main.md"' +
+                    '  },' +
+                    '  cliPrompts: {' +
+                    '    story_development: ["./.dmtools/prompts/role.md", "./.dmtools/prompts/focus.md"]' +
+                    '  },' +
+                    '  agentParamPatches: {' +
+                    '    story_development: { aiRole: "Senior Engineer", customFlag: true }' +
+                    '  },' +
+                    '  jobParamPatches: {' +
+                    '    story_development: { confluencePages: ["./.dmtools/instructions/project.md"], isGenerateNew: false }' +
+                    '  }' +
+                    '};'
+            },
+            tickets: [{ key: 'P-2', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", { configFile: 'agents/story_development.json' })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.equal(decoded.params.cliPrompt, './.dmtools/prompts/main.md');
+        // cliPrompts = agent JSON cliPrompts + config cliPrompts (role, focus)
+        var storyDevRaw = file_read({ path: 'agents/story_development.json' }) ||
+                          file_read({ path: 'story_development.json' });
+        var storyDevJson = JSON.parse(storyDevRaw);
+        var expectedCliPrompts = storyDevJson.params.cliPrompts.concat([
+            './.dmtools/prompts/role.md',
+            './.dmtools/prompts/focus.md'
+        ]);
+        assert.deepEqual(decoded.params.cliPrompts, expectedCliPrompts);
+        assert.equal(decoded.params.agentParams.aiRole, 'Senior Engineer');
+        assert.equal(decoded.params.agentParams.customFlag, true);
+        assert.deepEqual(decoded.params.confluencePages, ['./.dmtools/instructions/project.md']);
+        assert.equal(decoded.params.isGenerateNew, false);
+    });
+
+    test('inputJql in encoded_config is always the real ticket key, not the agent JSON placeholder', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'P-99', fields: { labels: [] } }]
+        });
+
+        // story_questions.json has inputJql: "key = JD-82" — must NOT appear in encoded_config
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { configFile: 'agents/story_questions.json' })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.equal(decoded.params.inputJql, 'key = P-99', 'inputJql must be the real ticket, not agent JSON default');
+    });
+
+    test('agentParams is always present in encoded_config (never null)', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-42', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { configFile: 'agents/story_questions.json' })
+        ]));
+
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.ok(decoded.params.agentParams !== null && decoded.params.agentParams !== undefined,
+            'agentParams must always be present to prevent NPE in Teammate.java');
+    });
+
+    test('primitive and array params from agent JSON are copied to encoded_config', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-5', fields: { labels: [] } }]
+        });
+
+        // story_questions.json has skipAIProcessing:true, alwaysPostComments:true, cliCommands, cliPrompts
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { configFile: 'agents/story_questions.json' })
+        ]));
+
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.equal(decoded.params.skipAIProcessing, true, 'skipAIProcessing copied from agent JSON');
+        assert.equal(decoded.params.alwaysPostComments, true, 'alwaysPostComments copied from agent JSON');
+        assert.ok(Array.isArray(decoded.params.cliCommands) && decoded.params.cliCommands.length > 0,
+            'cliCommands array copied from agent JSON');
+        assert.ok(Array.isArray(decoded.params.cliPrompts) && decoded.params.cliPrompts.length > 0,
+            'cliPrompts array copied from agent JSON');
+    });
+
+});
+
+// ── targetStatus ──────────────────────────────────────────────────────────────
+
+suite('smAgent: targetStatus', function() {
+
+    test('moves ticket to targetStatus before triggering workflow', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = X", { targetStatus: 'In Development' })
+        ]));
+
+        assert.equal(sm.capturedStatusMoves.length, 1);
+        assert.equal(sm.capturedStatusMoves[0].key, 'T-1');
+        assert.equal(sm.capturedStatusMoves[0].statusName, 'In Development');
+        assert.equal(sm.capturedTriggers.length, 1, 'workflow also triggered');
+    });
+
+});
+
+// ── Per-rule configPath (multi-project) ───────────────────────────────────────
+
+suite('smAgent: per-rule configPath (multi-project)', function() {
+
+    test('rule with configPath uses its own jiraProject for JQL', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'projects/web/.dmtools/config.js':
+                    'module.exports = { jira: { project: "WEB", parentTicket: "WEB-1" }, repository: { owner: "web-org", repo: "web-repo" } };'
+            }
+        });
+
+        sm.action(baseParams('global-org', 'global-repo', [
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                configPath: 'projects/web/.dmtools/config.js'
+            })
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1);
+        assert.contains(sm.capturedJqls[0], 'project = WEB', 'per-rule jiraProject used');
+        assert.notContains(sm.capturedJqls[0], 'global', 'global config not used in JQL');
+    });
+
+    test('rule with configPath triggers workflow against its own repo', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'projects/web/.dmtools/config.js':
+                    'module.exports = { jira: { project: "WEB" }, repository: { owner: "web-org", repo: "web-repo" } };'
+            },
+            tickets: [{ key: 'WEB-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('global-org', 'global-repo', [
+            makeRule("project = {jiraProject}", {
+                configPath: 'projects/web/.dmtools/config.js'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        assert.equal(sm.capturedTriggers[0].owner, 'web-org', 'web-org used for trigger');
+        assert.equal(sm.capturedTriggers[0].repo, 'web-repo', 'web-repo used for trigger');
+    });
+
+    test('mixed rules: some with configPath, some using global', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = { jira: { project: "GLOBAL", parentTicket: "GLOBAL-1" }, repository: { owner: "global-org", repo: "global-repo" } };',
+                'projects/mobile/.dmtools/config.js':
+                    'module.exports = { jira: { project: "MOBILE" }, repository: { owner: "mobile-org", repo: "mobile-repo" } };'
+            }
+        });
+
+        sm.action(baseParams('global-org', 'global-repo', [
+            makeRule("project = {jiraProject} AND status = 'Backlog'"),
+            makeRule("project = {jiraProject} AND status = 'Ready'", {
+                configPath: 'projects/mobile/.dmtools/config.js'
+            })
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 2);
+        assert.contains(sm.capturedJqls[0], 'project = GLOBAL', 'global rule uses global config');
+        assert.contains(sm.capturedJqls[1], 'project = MOBILE', 'per-rule config used for mobile');
+    });
+
+    test('per-rule configPath is propagated to encoded_config customParams', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'projects/web/.dmtools/config.js':
+                    'module.exports = { jira: { project: "WEB" }, repository: { owner: "web-org", repo: "web-repo" } };'
+            },
+            tickets: [{ key: 'WEB-5', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [
+            makeRule("project = {jiraProject}", {
+                configPath: 'projects/web/.dmtools/config.js'
+            })
+        ]));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        var decoded = JSON.parse(decodeURIComponent(inputs.encoded_config));
+        assert.ok(decoded.params.customParams, 'customParams present');
+        assert.equal(decoded.params.customParams.configPath, 'projects/web/.dmtools/config.js',
+            'configPath propagated downstream');
+    });
+
+    test('rule with configPath that fails to load falls back to global config', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "GLOBAL" }, repository: { owner: "g-org", repo: "g-repo" } };'
+            }
+        });
+
+        sm.action(baseParams('g-org', 'g-repo', [
+            makeRule("project = {jiraProject}", {
+                configPath: 'nonexistent/path/config.js'  // doesn't exist in fileMap
+            })
+        ]));
+
+        assert.equal(sm.capturedJqls.length, 1);
+        assert.contains(sm.capturedJqls[0], 'project = GLOBAL', 'falls back to global when configPath fails');
+    });
+
+});
+
+// ── agentConfigsDir — config.js owns agent paths ─────────────────────────────
+
+suite('smAgent: agentConfigsDir (config.js owns agent paths)', function() {
+
+    test('short configFile resolved against agentConfigsDir', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "P" },' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  agentConfigsDir: "projects/demo",' +
+                    '  smRules: [{ jql: "project = {jiraProject}", configFile: "StoryAgent.json" }]' +
+                    '};'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', [])); // rules from config (smRules override)
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.config_file, 'projects/demo/StoryAgent.json',
+            'short configFile prefixed with agentConfigsDir');
+    });
+
+    test('full configFile path (contains "/") is NOT modified by agentConfigsDir', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "P" },' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  agentConfigsDir: "projects/demo",' +
+                    '  smRules: [{ jql: "project = {jiraProject}", configFile: "agents/story_development.json" }]' +
+                    '};'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', []));
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.config_file, 'agents/story_development.json',
+            'full path left unchanged');
+    });
+
+    test('agentConfigsDir config discovery: sm.json can use agentConfigsDir instead of configPath', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                'projects/alpha/.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "ALPHA" },' +
+                    '  repository: { owner: "test-org", repo: "alpha-repo" },' +
+                    '  agentConfigsDir: "projects/alpha",' +
+                    '  smRules: [{ jql: "project = {jiraProject}", configFile: "StoryAgent.json" }]' +
+                    '};'
+            },
+            tickets: [{ key: 'ALPHA-5', fields: { labels: [] } }]
+        });
+
+        // sm.json passes agentConfigsDir instead of configPath — no configPath needed
+        sm.action({ jobParams: { agentConfigsDir: 'projects/alpha' } });
+
+        assert.equal(sm.capturedTriggers.length, 1);
+        assert.equal(sm.capturedTriggers[0].owner, 'test-org');
+        assert.equal(sm.capturedTriggers[0].repo, 'alpha-repo');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.contains(sm.capturedJqls[0], 'project = ALPHA', 'ALPHA project from config');
+        assert.equal(inputs.config_file, 'projects/alpha/StoryAgent.json',
+            'short configFile resolved to full path');
+    });
+
+    test('agentConfigsDir trailing slash is stripped', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js':
+                    'module.exports = {' +
+                    '  jira: { project: "P" },' +
+                    '  repository: { owner: "o", repo: "r" },' +
+                    '  agentConfigsDir: "projects/demo/",' + // trailing slash
+                    '  smRules: [{ jql: "project = {jiraProject}", configFile: "ReviewAgent.json" }]' +
+                    '};'
+            },
+            tickets: [{ key: 'P-1', fields: { labels: [] } }]
+        });
+
+        sm.action(baseParams('o', 'r', []));
+
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.config_file, 'projects/demo/ReviewAgent.json',
+            'no double slash from trailing agentConfigsDir slash');
+    });
+
+});
+
+// ── Targeted mode ─────────────────────────────────────────────────────────────
+
+suite('smAgent: targeted mode', function() {
+
+    test('targetTicket + targetAgent bypasses all rules and dispatches exactly that ticket', function() {
+        var sm = makeSmAgent({
+            fileMap: {
+                '../.dmtools/config.js': 'module.exports = { jira: { project: "JD" }, repository: { owner: "o", repo: "r" } };'
+            },
+            tickets: [{ key: 'JD-123', fields: { labels: [] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                targetTicket: 'JD-123',
+                targetAgent: 'agents/story_solution.json'
+            }
+        });
+
+        assert.equal(sm.capturedJqls.length, 1, 'exactly one JQL executed');
+        assert.equal(sm.capturedJqls[0], 'key = JD-123', 'JQL targets exact ticket');
+        assert.equal(sm.capturedTriggers.length, 1, 'one workflow triggered');
+        var inputs = JSON.parse(sm.capturedTriggers[0].inputs);
+        assert.equal(inputs.config_file, 'agents/story_solution.json', 'correct agent used');
+        assert.contains(inputs.input_jql, 'JD-123', 'input_jql contains ticket key');
+    });
+
+    test('inherits localExecution and concurrencyKey from matching rule', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'P-7', fields: { labels: [] } }]
+        });
+
+        // sm.json has a rule for bulk_bugs_creation with localExecution=false and concurrencyKey
+        // Use story_solution rule which exists in sm.json
+        sm.action({
+            jobParams: {
+                targetTicket: 'P-7',
+                targetAgent: 'agents/story_solution.json',
+                rules: [
+                    {
+                        description: 'Story solution rule',
+                        jql: "project = TEST AND status = 'Solution Architecture'",
+                        configFile: 'agents/story_solution.json',
+                        skipIfLabel: 'sm_story_solution_triggered',
+                        addLabel: 'sm_story_solution_triggered',
+                        enabled: true
+                    }
+                ],
+                owner: 'o',
+                repo: 'r'
+            }
+        });
+
+        assert.equal(sm.capturedJqls.length, 1, 'only targeted JQL ran');
+        assert.equal(sm.capturedJqls[0], 'key = P-7', 'JQL overridden to ticket key');
+        // addLabel is inherited, skipIfLabel is stripped
+        assert.equal(sm.capturedTriggers.length, 1, 'workflow triggered');
+    });
+
+    test('strips skipIfLabel from inherited rule so label on ticket does not block run', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'X-9', fields: { labels: ['sm_story_solution_triggered'] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                targetTicket: 'X-9',
+                targetAgent: 'agents/story_solution.json',
+                rules: [
+                    {
+                        description: 'Story solution rule',
+                        jql: "project = TEST AND status = 'Solution Architecture'",
+                        configFile: 'agents/story_solution.json',
+                        skipIfLabel: 'sm_story_solution_triggered',
+                        enabled: true
+                    }
+                ],
+                owner: 'o',
+                repo: 'r'
+            }
+        });
+
+        assert.equal(sm.capturedTriggers.length, 1, 'skipIfLabel stripped — run proceeds');
+    });
+
+    test('falls back to minimal synthetic rule when no matching rule found', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'Z-1', fields: { labels: [] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                targetTicket: 'Z-1',
+                targetAgent: 'agents/story_solution.json',
+                rules: [], // no rules — no match possible
+                owner: 'o',
+                repo: 'r'
+            }
+        });
+
+        assert.equal(sm.capturedJqls.length, 1, 'synthetic rule JQL ran');
+        assert.equal(sm.capturedJqls[0], 'key = Z-1', 'synthetic JQL correct');
+        assert.equal(sm.capturedTriggers.length, 1, 'workflow triggered via synthetic rule');
+    });
+
+    test('matches rule by configFile regardless of agents/ prefix', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'M-2', fields: { labels: [] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                targetTicket: 'M-2',
+                targetAgent: 'story_solution.json',  // no agents/ prefix
+                rules: [
+                    {
+                        description: 'Story solution rule',
+                        jql: "project = TEST AND status = 'Solution Architecture'",
+                        configFile: 'agents/story_solution.json', // has agents/ prefix
+                        enabled: true
+                    }
+                ],
+                owner: 'o',
+                repo: 'r'
+            }
+        });
+
+        assert.equal(sm.capturedTriggers.length, 1, 'rule matched despite agents/ prefix mismatch');
+    });
+
+    test('targeted mode disables workflow cap', function() {
+        var sm = makeSmAgent({
+            fileMap: {},
+            tickets: [{ key: 'T-5', fields: { labels: [] } }]
+        });
+
+        sm.action({
+            jobParams: {
+                targetTicket: 'T-5',
+                targetAgent: 'agents/pr_review.json',
+                maxTriggeredWorkflows: 0,
+                rules: [],
+                owner: 'o',
+                repo: 'r'
+            }
+        });
+
+        assert.equal(sm.capturedTriggers.length, 1, 'trigger not blocked by workflow cap');
+    });
+
+    test('targeted mode does not trigger when targetTicket is missing', function() {
+        var sm = makeSmAgent({ fileMap: {}, tickets: [] });
+
+        var result = sm.action({
+            jobParams: {
+                targetAgent: 'agents/story_solution.json',
+                owner: 'o',
+                repo: 'r',
+                rules: []
+            }
+        });
+
+        assert.equal(result.success, false, 'fails without rules when no targetTicket');
+    });
+
+    test('targeted mode does not trigger when targetAgent is missing', function() {
+        var sm = makeSmAgent({ fileMap: {}, tickets: [] });
+
+        var result = sm.action({
+            jobParams: {
+                targetTicket: 'P-1',
+                owner: 'o',
+                repo: 'r',
+                rules: []
+            }
+        });
+
+        assert.equal(result.success, false, 'falls through to no-rules error without targetAgent');
+    });
+
+});

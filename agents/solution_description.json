@@ -1,0 +1,46 @@
+{
+  "name": "Teammate",
+  "params": {
+    "metadata": {
+      "contextId": "solution_design_description",
+      "descriptionPath": "agents/docs/agents/solution_description.md"
+    },
+    "cliCommands": [
+      "./agents/scripts/run-agent.sh"
+    ],
+    "outputType": "none",
+    "ticketContextDepth": 0,
+    "attachResponseAsFile": false,
+    "skipAIProcessing": true,
+    "alwaysPostComments": true,
+    "preJSAction": "agents/js/checkWipLabel.js",
+    "preCliJSAction": "agents/js/fetchParentContextToInput.js",
+    "postJSAction": "agents/js/enhanceSolutionDesignDescriptionAndAssess.js",
+    "inputJql": "key in (JD-9)",
+    "cliPrompts": [
+      "Senior Software Architect",
+      "./agents/instructions/common/agent_task_preamble.md",
+      "./agents/instructions/solution_description/workflow.md",
+      "./agents/instructions/common/input_context_reading.md",
+      "./agents/instructions/common/response_output.md",
+      "./agents/instructions/common/no_development.md",
+      "./agents/instructions/common/error_handling.md",
+      "./agents/instructions/common/preserve_references.md",
+      "./agents/instructions/common/media_handling.md",
+      "./agents/instructions/enhancement/solution_design_formatting_rules.md",
+      "./agents/instructions/common/diagram_output_contract.md",
+      "./agents/instructions/enhancement/solution_design_few_shots.md",
+      "./agents/prompts/bash_tools.md"
+    ],
+    "cliPromptsByTracker": {
+      "jira": [
+        "./agents/instructions/common/jira_context.md",
+        "./agents/instructions/tracker/jira_markup_transform.md"
+      ],
+      "ado": [
+        "./agents/instructions/tracker/ado_context.md",
+        "./agents/instructions/tracker/ado_markup_transform.md"
+      ]
+    }
+  }
+}
